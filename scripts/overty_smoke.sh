@@ -3,7 +3,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${OVERTY_CDP_PORT:-9222}"
-ALLOW_NO_BROWSER_SMOKE="${OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE:-0}"
+ALLOW_NO_CHROME_SMOKE="${OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE:-0}"
+
+find_playwright_chrome() {
+  local candidates
+  local candidate
+  local executable
+
+  if [[ -n "${OVERTY_PLAYWRIGHT_NODE_PATH:-}" ]]; then
+    candidates=("$OVERTY_PLAYWRIGHT_NODE_PATH")
+  else
+    candidates=(
+      "$HOME/Desktop/CLAUDE/MCP/playwright-mcp/node_modules"
+      "/usr/local/lib/node_modules"
+      "/usr/lib/node_modules"
+      "$HOME/.node_modules"
+    )
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -z "$candidate" || ! -d "$candidate" ]]; then
+      continue
+    fi
+    executable="$(NODE_PATH="$candidate" node -e 'try { const p = require("playwright").chromium.executablePath(); if (p) process.stdout.write(p); } catch (e) {}' 2>/dev/null || true)"
+    if [[ -n "$executable" && -x "$executable" ]]; then
+      echo "$executable"
+      return 0
+    fi
+  done
+  return 1
+}
 
 # You can override the browser binary with OVERTY_CHROME_BIN=/path/to/chrome
 CHROME_BIN="${OVERTY_CHROME_BIN:-}"
@@ -17,6 +46,9 @@ if [[ -z "$CHROME_BIN" ]]; then
   else
     MS_PW="$HOME/.cache/ms-playwright"
     CHROME_BIN="$(ls -dt "$MS_PW"/chromium-*/chrome-linux64/chrome 2>/dev/null | head -1 || true)"
+    if [[ -z "$CHROME_BIN" ]]; then
+      CHROME_BIN="$(find_playwright_chrome || true)"
+    fi
   fi
 fi
 
@@ -26,7 +58,7 @@ run_protocol_fallback() {
 }
 
 if [[ -z "$CHROME_BIN" || ! -x "$CHROME_BIN" ]]; then
-  if [[ "$ALLOW_NO_BROWSER_SMOKE" == "1" || "$ALLOW_NO_BROWSER_SMOKE" == "true" ]]; then
+  if [[ "$ALLOW_NO_CHROME_SMOKE" == "1" || "$ALLOW_NO_CHROME_SMOKE" == "true" ]]; then
     run_protocol_fallback
   fi
   echo "Could not find a Chromium/Chrome binary. Set OVERTY_CHROME_BIN to an executable path." >&2
@@ -88,7 +120,7 @@ if [[ $ready -ne 1 ]]; then
   echo "CHROME_LOG=$CHROME_LOG" >&2
   tail -n 80 "$CHROME_LOG" >&2 || true
   echo "" >&2
-  if [[ "$ALLOW_NO_BROWSER_SMOKE" == "1" || "$ALLOW_NO_BROWSER_SMOKE" == "true" ]]; then
+  if [[ "$ALLOW_NO_CHROME_SMOKE" == "1" || "$ALLOW_NO_CHROME_SMOKE" == "true" ]]; then
     echo "Falling back to protocol-only smoke due to missing CDP readiness." >&2
     run_protocol_fallback
   fi

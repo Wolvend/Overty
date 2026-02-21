@@ -52,6 +52,12 @@ You can also keep `npm run smoke` working in browserless environments by enablin
 OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE=1 npm run smoke
 ```
 
+If you have Playwright installed somewhere else and want smoke tests to discover its Chromium binary automatically, set:
+
+```bash
+OVERTY_PLAYWRIGHT_NODE_PATH=/path/to/node_modules node ...
+```
+
 ## Run (stdio)
 
 ```bash
