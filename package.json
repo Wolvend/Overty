@@ -1,0 +1,15 @@
+{
+  "name": "overty",
+  "version": "0.1.0",
+  "description": "Minimal MCP stdio server for Chrome DevTools Protocol (CDP) UI iteration workflows",
+  "private": true,
+  "bin": {
+    "overty": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "./scripts/overty_smoke.sh",
+    "smoke:protocol": "./scripts/overty_smoke_protocol.sh"
+  }
+}
+
