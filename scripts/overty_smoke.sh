@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${OVERTY_CDP_PORT:-9222}"
+ALLOW_NO_BROWSER_SMOKE="${OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE:-0}"
 
 # You can override the browser binary with OVERTY_CHROME_BIN=/path/to/chrome
 CHROME_BIN="${OVERTY_CHROME_BIN:-}"
@@ -19,14 +20,26 @@ if [[ -z "$CHROME_BIN" ]]; then
   fi
 fi
 
+run_protocol_fallback() {
+  echo "Could not run browser-dependent smoke. Falling back to protocol-only smoke: ./scripts/overty_smoke_protocol.sh" >&2
+  exec "$ROOT/scripts/overty_smoke_protocol.sh"
+}
+
 if [[ -z "$CHROME_BIN" || ! -x "$CHROME_BIN" ]]; then
+  if [[ "$ALLOW_NO_BROWSER_SMOKE" == "1" || "$ALLOW_NO_BROWSER_SMOKE" == "true" ]]; then
+    run_protocol_fallback
+  fi
   echo "Could not find a Chromium/Chrome binary. Set OVERTY_CHROME_BIN to an executable path." >&2
   exit 2
 fi
 
-RUN_DIR="${OVERTY_RUN_DIR:-"$ROOT/output/overty/smoke-$(date +%s)"}"
+RUN_TAG="${OVERTY_SMOKE_TAG:-smoke-$(date +%s)}"
+RUN_DIR="${OVERTY_RUN_DIR:-"$ROOT/output/overty/$RUN_TAG"}"
+SMOKE_SCREENSHOT_DIR="${OVERTY_SCREENSHOT_DIR:-"$ROOT/output/overty/screenshots/$RUN_TAG"}"
+SMOKE_BUNDLE_DIR="${OVERTY_BUNDLE_DIR:-"$ROOT/output/overty/bundles/$RUN_TAG"}"
+SMOKE_MOCKUPS_DIR="${OVERTY_MOCKUP_DIR:-"$ROOT/output/overty/mockups/$RUN_TAG"}"
 PROFILE_DIR="$RUN_DIR/chrome-profile"
-mkdir -p "$PROFILE_DIR"
+mkdir -p "$PROFILE_DIR" "$SMOKE_SCREENSHOT_DIR" "$SMOKE_BUNDLE_DIR" "$SMOKE_MOCKUPS_DIR"
 
 CHROME_LOG="$RUN_DIR/chrome.log"
 SERVER_LOG="$RUN_DIR/server.log"
@@ -75,7 +88,11 @@ if [[ $ready -ne 1 ]]; then
   echo "CHROME_LOG=$CHROME_LOG" >&2
   tail -n 80 "$CHROME_LOG" >&2 || true
   echo "" >&2
-  echo "Try: set OVERTY_CHROME_BIN to a system Chrome/Chromium build, or run protocol-only smoke:" >&2
+  if [[ "$ALLOW_NO_BROWSER_SMOKE" == "1" || "$ALLOW_NO_BROWSER_SMOKE" == "true" ]]; then
+    echo "Falling back to protocol-only smoke due to missing CDP readiness." >&2
+    run_protocol_fallback
+  fi
+  echo "Try: set OVERTY_CHROME_BIN to a system Chrome/Chromium build, or set OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE=1 and run protocol-only fallback." >&2
   echo "  ./scripts/overty_smoke_protocol.sh" >&2
   exit 3
 fi
@@ -89,12 +106,12 @@ cat >"$REQ_OUT" <<JSON
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"install_css","arguments":{"css":"$CSS_BASE"}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"navigate","arguments":{"url":"data:text/html,$HTML_DOC","waitUntil":"load","timeoutMs":30000}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"wait_for_network_idle","arguments":{"idleMs":200,"timeoutMs":10000}}}
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"take_screenshot","arguments":{"fullPage":false,"filePath":"$RUN_DIR/live.png"}}}
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"screenshot_element","arguments":{"selector":".card","paddingPx":8,"filePath":"$RUN_DIR/card.png"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"take_screenshot","arguments":{"fullPage":false,"filePath":"$SMOKE_SCREENSHOT_DIR/live.png"}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"screenshot_element","arguments":{"selector":".card","paddingPx":8,"filePath":"$SMOKE_SCREENSHOT_DIR/card.png"}}}
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"audit_layout","arguments":{"tolerancePx":1,"maxElements":10}}}
 {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"list_events","arguments":{"limit":50}}}
-{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"capture_bundle","arguments":{"label":"after","outputDir":"$RUN_DIR/bundle","fullPage":false}}}
-{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"render_html_mockups","arguments":{"browserUrl":"http://127.0.0.1:$PORT","outputDir":"$RUN_DIR/mockups","viewport":{"width":1200,"height":800},"html":"$HTML_DOC","baseCss":"$CSS_BASE","variants":[{"name":"aura","css":".card{background:linear-gradient(135deg,#1b2b6b,#151b2b)} h1{letter-spacing:.06em}","fullPage":false},{"name":"paper","css":"body{background:#f6f3ee;color:#111}.card{background:#fff;box-shadow:0 18px 40px rgba(17,17,17,.12)} #btn{background:#111}","fullPage":false},{"name":"mono","css":"body{font-family:ui-monospace,Menlo,monospace;background:#0f0f10;color:#f2f2f2}.card{border:1px solid rgba(255,255,255,.12);background:#0f0f10} #btn{background:#22c55e;color:#052e16}","fullPage":false}]}}}
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"capture_bundle","arguments":{"label":"after","outputDir":"$SMOKE_BUNDLE_DIR","fullPage":false}}}
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"render_html_mockups","arguments":{"browserUrl":"http://127.0.0.1:$PORT","outputDir":"$SMOKE_MOCKUPS_DIR","viewport":{"width":1200,"height":800},"html":"$HTML_DOC","baseCss":"$CSS_BASE","variants":[{"name":"aura","css":".card{background:linear-gradient(135deg,#1b2b6b,#151b2b)} h1{letter-spacing:.06em}","fullPage":false},{"name":"paper","css":"body{background:#f6f3ee;color:#111}.card{background:#fff;box-shadow:0 18px 40px rgba(17,17,17,.12)} #btn{background:#111}","fullPage":false},{"name":"mono","css":"body{font-family:ui-monospace,Menlo,monospace;background:#0f0f10;color:#f2f2f2}.card{border:1px solid rgba(255,255,255,.12);background:#0f0f10} #btn{background:#22c55e;color:#052e16}","fullPage":false}]}}}
 {"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"close_target","arguments":{}}}
 JSON
 
@@ -105,26 +122,25 @@ if [[ ! -s "$RPC_OUT" ]]; then
   echo "Smoke failed: no JSON-RPC output at $RPC_OUT" >&2
   exit 10
 fi
-if [[ ! -f "$RUN_DIR/live.png" ]]; then
-  echo "Smoke failed: missing $RUN_DIR/live.png" >&2
+if [[ ! -f "$SMOKE_SCREENSHOT_DIR/live.png" ]]; then
+  echo "Smoke failed: missing $SMOKE_SCREENSHOT_DIR/live.png" >&2
   exit 11
 fi
-if [[ ! -f "$RUN_DIR/card.png" ]]; then
-  echo "Smoke failed: missing $RUN_DIR/card.png" >&2
+if [[ ! -f "$SMOKE_SCREENSHOT_DIR/card.png" ]]; then
+  echo "Smoke failed: missing $SMOKE_SCREENSHOT_DIR/card.png" >&2
   exit 12
 fi
-if [[ ! -f "$RUN_DIR/bundle/bundle.json" ]]; then
-  echo "Smoke failed: missing $RUN_DIR/bundle/bundle.json" >&2
+if [[ ! -f "$SMOKE_BUNDLE_DIR/bundle.json" ]]; then
+  echo "Smoke failed: missing $SMOKE_BUNDLE_DIR/bundle.json" >&2
   exit 13
 fi
-if [[ ! -f "$RUN_DIR/mockups/manifest.json" ]]; then
-  echo "Smoke failed: missing $RUN_DIR/mockups/manifest.json" >&2
+if [[ ! -f "$SMOKE_MOCKUPS_DIR/manifest.json" ]]; then
+  echo "Smoke failed: missing $SMOKE_MOCKUPS_DIR/manifest.json" >&2
   exit 14
 fi
-if [[ ! -f "$RUN_DIR/mockups/index.html" ]]; then
-  echo "Smoke failed: missing $RUN_DIR/mockups/index.html" >&2
+if [[ ! -f "$SMOKE_MOCKUPS_DIR/index.html" ]]; then
+  echo "Smoke failed: missing $SMOKE_MOCKUPS_DIR/index.html" >&2
   exit 15
 fi
 
 echo "SMOKE_OK $RUN_DIR"
-

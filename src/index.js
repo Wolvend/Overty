@@ -27,6 +27,7 @@
  */
 
 const fs = require('node:fs');
+const { spawn } = require('node:child_process');
 const path = require('node:path');
 
 const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -34,6 +35,18 @@ const SERVER_INFO = { name: 'overty', version: '0.1.0' };
 const DEBUG = process.env.OVERTY_DEBUG === '1';
 
 const DEFAULT_BROWSER_URL = process.env.OVERTY_BROWSER_URL || 'http://127.0.0.1:9222';
+const OVERTY_WITH_CHROME_DEVTOOLS = process.env.OVERTY_WITH_CHROME_DEVTOOLS === '1' || process.env.OVERTY_WITH_CHROME_DEVTOOLS === 'true';
+
+const OVERTY_CHROME_DEVTOOLS_EXEC = process.env.OVERTY_CHROME_DEVTOOLS_EXEC || process.execPath || 'node';
+const OVERTY_CHROME_DEVTOOLS_DEFAULT_CMD = path.resolve(__dirname, '..', '..', 'chrome-devtools-mcp', 'build', 'src', 'index.js');
+const OVERTY_CHROME_DEVTOOLS_CMD =
+  process.env.OVERTY_CHROME_DEVTOOLS_CMD ||
+  (isNodeExecutable(OVERTY_CHROME_DEVTOOLS_EXEC)
+    ? OVERTY_CHROME_DEVTOOLS_DEFAULT_CMD
+    : '');
+const OVERTY_CHROME_DEVTOOLS_ARGS = parseChromeDevtoolsArgs(process.env.OVERTY_CHROME_DEVTOOLS_ARGS || '');
+const OVERTY_CHROME_DEVTOOLS_START_DELAY_MS = Number.parseInt(process.env.OVERTY_CHROME_DEVTOOLS_START_DELAY_MS || '1500', 10);
+
 const DEFAULT_SCREENSHOT_DIR =
   process.env.OVERTY_SCREENSHOT_DIR ||
   path.resolve(process.cwd(), 'output', 'overty', 'screenshots');
@@ -47,9 +60,155 @@ const DEFAULT_MATRIX_DIR =
   process.env.OVERTY_MATRIX_DIR || path.resolve(process.cwd(), 'output', 'overty', 'qa-matrix');
 const DEFAULT_DIFF_DIR =
   process.env.OVERTY_DIFF_DIR || path.resolve(process.cwd(), 'output', 'overty', 'diffs');
+const SAFE_OUTPUT_DIRS = (() => {
+  const roots = [
+    DEFAULT_SCREENSHOT_DIR,
+    DEFAULT_MOCKUP_DIR,
+    DEFAULT_BUNDLE_DIR,
+    DEFAULT_MATRIX_DIR,
+    DEFAULT_DIFF_DIR,
+  ].map((value) => path.resolve(String(value || '').trim()));
+
+  const seen = new Set();
+  const deduped = [];
+  for (const root of roots) {
+    if (!root) continue;
+    if (!seen.has(root)) {
+      seen.add(root);
+      deduped.push(root);
+    }
+  }
+
+  return deduped;
+})();
 
 const MAX_INLINE_SCREENSHOT_BYTES = 2_000_000; // keep responses reasonably sized
 const DEFAULT_STYLE_ID = 'overty-style';
+const CHROME_DEVTOOLS_MCP_PROCESS = OVERTY_WITH_CHROME_DEVTOOLS
+  ? {
+      exec: OVERTY_CHROME_DEVTOOLS_EXEC,
+      command: OVERTY_CHROME_DEVTOOLS_CMD,
+      args: OVERTY_CHROME_DEVTOOLS_ARGS,
+    }
+  : null;
+let chromeDevtoolsProcess = null;
+let chromeDevtoolsStartupLogged = false;
+
+function parseChromeDevtoolsArgs(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+
+  try {
+    const parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) {
+      return parsed.map((entry) => String(entry || '').trim()).filter(Boolean);
+    }
+  } catch (_err) {
+    // Fall back to shell-like tokenization.
+  }
+
+  const tokenRe = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\\S+)/g;
+  const matches = s.match(tokenRe);
+  if (!matches) return [];
+  return matches.map((token) => {
+    if (
+      (token[0] === '"' && token[token.length - 1] === '"') ||
+      (token[0] === "'" && token[token.length - 1] === "'")
+    ) {
+      const body = token.slice(1, -1);
+      return body.replace(/\\\\/g, '\\').replace(/\\"/g, '"').replace(/\\'/g, "'");
+    }
+    return token;
+  });
+}
+
+function isNodeExecutable(execPathOrName) {
+  const normalized = String(execPathOrName || '').toLowerCase();
+  const base = path.basename(normalized);
+  return base === 'node' || base === 'node.exe' || base === 'nodejs' || /[/\\]node(?:\.exe)?$/.test(normalized);
+}
+
+function spawnChromeDevtoolsMcpChild() {
+  if (!CHROME_DEVTOOLS_MCP_PROCESS) return null;
+  const scriptPath = String(CHROME_DEVTOOLS_MCP_PROCESS.command || '').trim();
+  const execPath = String(CHROME_DEVTOOLS_MCP_PROCESS.exec || '').trim();
+  const isNodeLaunch = isNodeExecutable(execPath);
+  if (isNodeLaunch && !scriptPath) {
+    log('OVERTY_WITH_CHROME_DEVTOOLS set with Node executable but no sidecar command configured; skipping child launch.');
+    return null;
+  }
+
+  const args = [...CHROME_DEVTOOLS_MCP_PROCESS.args];
+  if (scriptPath) {
+    args.unshift(scriptPath);
+  }
+
+  const proc = spawn(CHROME_DEVTOOLS_MCP_PROCESS.exec, args, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  proc.on('exit', (code, signal) => {
+    const suffix = code !== null ? `exit ${code}` : `signal ${signal || 'unknown'}`;
+    log(`chrome-devtools-mcp child ${suffix}`);
+  });
+  proc.on('error', (err) => {
+    log('Failed to spawn chrome-devtools-mcp child:', err && err.message ? err.message : err);
+  });
+  if (proc.stderr) {
+    proc.stderr.setEncoding('utf8');
+    proc.stderr.on('data', (chunk) => {
+      const text = String(chunk || '').trim();
+      if (!text) return;
+      log(`[chrome-devtools-mcp] ${text}`);
+    });
+  }
+
+  return { proc, args };
+}
+
+async function startChromeDevtoolsMcpChild() {
+  if (!CHROME_DEVTOOLS_MCP_PROCESS) return;
+  if (chromeDevtoolsProcess) return;
+  const child = spawnChromeDevtoolsMcpChild();
+  if (!child || !child.proc) return;
+  chromeDevtoolsProcess = child.proc;
+  const startupArgs = child.args || [];
+
+  const delayMs = Number.isFinite(OVERTY_CHROME_DEVTOOLS_START_DELAY_MS) && OVERTY_CHROME_DEVTOOLS_START_DELAY_MS > 0
+    ? Math.floor(OVERTY_CHROME_DEVTOOLS_START_DELAY_MS)
+    : 0;
+  if (delayMs > 0) {
+    await sleep(delayMs);
+  }
+  if (chromeDevtoolsProcess.exitCode !== null) {
+    chromeDevtoolsProcess = null;
+    throw new Error(`chrome-devtools-mcp child exited during startup for ${OVERTY_CHROME_DEVTOOLS_CMD}`);
+  }
+
+  if (!chromeDevtoolsStartupLogged) {
+    const formattedCommand = [CHROME_DEVTOOLS_MCP_PROCESS.exec, ...startupArgs].map((arg) => JSON.stringify(String(arg))).join(' ');
+    log(`Started chrome-devtools-mcp sidecar: ${formattedCommand}`);
+    chromeDevtoolsStartupLogged = true;
+  }
+}
+
+async function shutdownChromeDevtoolsMcpChild() {
+  if (!chromeDevtoolsProcess) return;
+  const proc = chromeDevtoolsProcess;
+  chromeDevtoolsProcess = null;
+
+  if (!proc.killed) {
+    proc.removeAllListeners('exit');
+    const exited = new Promise((resolve) => {
+      proc.once('exit', () => resolve());
+    });
+    proc.kill('SIGTERM');
+    const timeout = sleep(2_000).then(() => 'timeout');
+    await Promise.race([exited, timeout]);
+    if (proc.exitCode === null) {
+      proc.kill('SIGKILL');
+    }
+  }
+}
 
 function log(...args) {
   // Never write logs to stdout; MCP uses stdout for protocol messages.
@@ -289,11 +448,28 @@ function toCdpHttpBase(browserUrl) {
 }
 
 function isSafeOutputPath(resolvedPath) {
-  // Basic sanity: avoid writing to filesystem roots accidentally.
-  const p = String(resolvedPath || '');
+  const p = path.resolve(String(resolvedPath || ''));
   if (!p) return false;
-  if (p === '/' || p === '\\') return false;
-  return true;
+  if (p === path.parse(p).root) return false;
+
+  const safeRoots = SAFE_OUTPUT_DIRS;
+  for (const root of safeRoots) {
+    const rel = path.relative(root, p);
+    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resolveSafeOutputPath(rawPath) {
+  const input = String(rawPath || '').trim();
+  if (!input) return null;
+  if (input.includes('\0')) return null;
+
+  const resolved = path.resolve(process.cwd(), input);
+  return isSafeOutputPath(resolved) ? resolved : null;
 }
 
 function sleep(ms) {
@@ -933,15 +1109,23 @@ class JsonRpcLineServer {
   }
 
   async _handleMessage(msg) {
+    const hasRequestId = Object.prototype.hasOwnProperty.call(msg || {}, 'id');
+    const requestId = hasRequestId ? msg.id : null;
+
     if (!msg || msg.jsonrpc !== '2.0') {
-      this.send(jsonRpcError(msg && msg.id ? msg.id : null, -32600, 'Invalid Request'));
+      this.send(jsonRpcError(requestId, -32600, 'Invalid Request'));
       return;
     }
 
     // We only handle requests + notifications from the client.
-    if (typeof msg.method !== 'string') return;
+    if (typeof msg.method !== 'string') {
+      if (hasRequestId) {
+        this.send(jsonRpcError(requestId, -32600, 'Invalid Request'));
+      }
+      return;
+    }
 
-    const isRequest = Object.prototype.hasOwnProperty.call(msg, 'id');
+    const isRequest = hasRequestId;
     if (!isRequest) {
       // Notification; best-effort handle, no response.
       try {
@@ -2953,7 +3137,8 @@ async function handleRequest(msg) {
           const baselinePathArg = typeof args.baselinePath === 'string' ? args.baselinePath.trim() : '';
           if (!baselinePathArg) return toolError('OVERTY_INVALID_ARG', 'Missing required string argument: baselinePath');
 
-          const baselinePath = path.resolve(process.cwd(), baselinePathArg);
+          const baselinePath = resolveSafeOutputPath(baselinePathArg);
+          if (!baselinePath) return toolError('OVERTY_INVALID_ARG', 'Invalid baselinePath');
           let baselineBuf;
           try {
             baselineBuf = fs.readFileSync(baselinePath);
@@ -2966,7 +3151,8 @@ async function handleRequest(msg) {
           let candidateDataUrl;
           let candidatePath = null;
           if (candidatePathArg) {
-            candidatePath = path.resolve(process.cwd(), candidatePathArg);
+            candidatePath = resolveSafeOutputPath(candidatePathArg);
+            if (!candidatePath) return toolError('OVERTY_INVALID_ARG', 'Invalid candidatePath');
             let candidateBuf;
             try {
               candidateBuf = fs.readFileSync(candidatePath);
@@ -3017,10 +3203,9 @@ async function handleRequest(msg) {
             diffBase64 = m ? m[1] : null;
 
             if (writeDiff) {
-              diffPath = args.diffPath
-                ? path.resolve(process.cwd(), String(args.diffPath))
-                : path.join(DEFAULT_DIFF_DIR, `diff-${nowFileSafe()}.png`);
-              if (!isSafeOutputPath(diffPath)) return toolError('OVERTY_INVALID_ARG', 'Invalid diffPath');
+              const requestedDiffPath = args.diffPath ? String(args.diffPath) : path.join(DEFAULT_DIFF_DIR, `diff-${nowFileSafe()}.png`);
+              diffPath = resolveSafeOutputPath(requestedDiffPath);
+              if (!diffPath) return toolError('OVERTY_INVALID_ARG', 'Invalid diffPath');
               atomicWriteFileSync(diffPath, diffBuf);
             }
           }
@@ -3096,9 +3281,9 @@ async function handleRequest(msg) {
           const inlineLimit = Number.isFinite(Number(args.inlineLimit)) ? Math.max(0, Math.floor(Number(args.inlineLimit))) : 0;
 
           const outputDir = args.outputDir
-            ? path.resolve(process.cwd(), String(args.outputDir))
+            ? resolveSafeOutputPath(String(args.outputDir))
             : path.join(DEFAULT_MATRIX_DIR, nowFileSafe());
-          if (!isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
+          if (!outputDir || !isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
           ensureDirSync(outputDir);
 
           const assertRules = args.assertRules && typeof args.assertRules === 'object' && !Array.isArray(args.assertRules) ? args.assertRules : {};
@@ -3285,9 +3470,9 @@ async function handleRequest(msg) {
 
           const label = typeof args.label === 'string' && args.label.trim() ? sanitizeFileBase(args.label) : 'bundle';
           const outputDir = args.outputDir
-            ? path.resolve(process.cwd(), String(args.outputDir))
+            ? resolveSafeOutputPath(String(args.outputDir))
             : path.join(DEFAULT_BUNDLE_DIR, `${nowFileSafe()}-${label}`);
-          if (!isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
+          if (!outputDir || !isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
           ensureDirSync(outputDir);
 
           const createdAt = new Date().toISOString();
@@ -3428,9 +3613,9 @@ async function handleRequest(msg) {
           const ext = format === 'jpeg' ? 'jpg' : format;
 
           const outputDir = args.outputDir
-            ? path.resolve(process.cwd(), String(args.outputDir))
+            ? resolveSafeOutputPath(String(args.outputDir))
             : path.join(DEFAULT_MOCKUP_DIR, nowFileSafe());
-          if (!isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
+          if (!outputDir || !isSafeOutputPath(outputDir)) return toolError('OVERTY_INVALID_ARG', 'Invalid outputDir');
           ensureDirSync(outputDir);
 
           let mockTarget = null;
@@ -3714,13 +3899,13 @@ async function handleRequest(msg) {
           const bytes = Buffer.from(shot.base64, 'base64');
           const ext = shot.format === 'jpeg' ? 'jpg' : shot.format;
 
-          const requestedPath = args.filePath ? String(args.filePath) : null;
+          const requestedPath = args.filePath ? String(args.filePath).trim() : null;
+          const safeRequestedPath = requestedPath ? resolveSafeOutputPath(requestedPath) : null;
+          if (requestedPath && !safeRequestedPath) return toolError('OVERTY_INVALID_ARG', 'Invalid filePath');
           const shouldInline = bytes.length < MAX_INLINE_SCREENSHOT_BYTES && !requestedPath;
 
           if (!shouldInline) {
-            const filePath = requestedPath
-              ? path.resolve(process.cwd(), requestedPath)
-              : path.join(DEFAULT_SCREENSHOT_DIR, `screenshot-${nowFileSafe()}.${ext}`);
+            const filePath = safeRequestedPath || path.join(DEFAULT_SCREENSHOT_DIR, `screenshot-${nowFileSafe()}.${ext}`);
             if (!isSafeOutputPath(filePath)) return toolError('OVERTY_INVALID_ARG', 'Invalid filePath');
             atomicWriteFileSync(filePath, bytes);
             return {
@@ -3816,6 +4001,8 @@ async function handleRequest(msg) {
 
           const requestedPath = args.filePath ? String(args.filePath) : null;
           const shouldInline = bytes.length < MAX_INLINE_SCREENSHOT_BYTES && !requestedPath;
+          const safeRequestedPath = requestedPath ? resolveSafeOutputPath(requestedPath.trim()) : null;
+          if (requestedPath && !safeRequestedPath) return toolError('OVERTY_INVALID_ARG', 'Invalid filePath');
 
           const meta = {
             selector: String(selector),
@@ -3829,9 +4016,7 @@ async function handleRequest(msg) {
           };
 
           if (!shouldInline) {
-            const filePath = requestedPath
-              ? path.resolve(process.cwd(), requestedPath)
-              : path.join(DEFAULT_SCREENSHOT_DIR, `element-${sanitizeFileBase(selector)}-${nowFileSafe()}.${ext}`);
+            const filePath = safeRequestedPath || path.join(DEFAULT_SCREENSHOT_DIR, `element-${sanitizeFileBase(selector)}-${nowFileSafe()}.${ext}`);
             if (!isSafeOutputPath(filePath)) return toolError('OVERTY_INVALID_ARG', 'Invalid filePath');
             atomicWriteFileSync(filePath, bytes);
             return {
@@ -3867,17 +4052,34 @@ async function handleRequest(msg) {
 
 const server = new JsonRpcLineServer(handleRequest);
 
-process.on('SIGINT', async () => {
-  log('SIGINT: closing CDP session');
-  await cdp.disconnect();
-  process.exit(0);
-});
+(async () => {
+  if (OVERTY_WITH_CHROME_DEVTOOLS) {
+    try {
+      await startChromeDevtoolsMcpChild();
+    } catch (err) {
+      log('Failed to start chrome-devtools-mcp sidecar:', err && err.message ? err.message : err);
+    }
+  }
 
-process.on('SIGTERM', async () => {
-  log('SIGTERM: closing CDP session');
-  await cdp.disconnect();
-  process.exit(0);
-});
+  const teardown = async () => {
+    if (chromeDevtoolsProcess) {
+      await shutdownChromeDevtoolsMcpChild();
+    }
+    await cdp.disconnect();
+  };
 
-log('MCP server running on stdio');
-server.start();
+  process.on('SIGINT', async () => {
+    log('SIGINT: closing CDP session + optional sidecars');
+    await teardown();
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', async () => {
+    log('SIGTERM: closing CDP session + optional sidecars');
+    await teardown();
+    process.exit(0);
+  });
+
+  log('MCP server running on stdio');
+  server.start();
+})(); 

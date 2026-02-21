@@ -30,7 +30,11 @@ Minimal MCP stdio server that connects to a Chrome DevTools Protocol (CDP) targe
 
 ## Smoke Test (Recommended)
 
-This repo includes a reproducible smoke test that launches headless Chrome with CDP enabled, runs a small JSON-RPC batch that touches the main tool surface (including `render_html_mockups`), and writes artifacts under `output/overty/`.
+This repo includes a reproducible smoke test that launches headless Chrome with CDP enabled, runs a small JSON-RPC batch that touches the main tool surface (including `render_html_mockups`), and writes artifacts under the safe output roots:
+
+- `output/overty/screenshots/`
+- `output/overty/bundles/`
+- `output/overty/mockups/`
 
 ```bash
 ./scripts/overty_smoke.sh
@@ -40,6 +44,12 @@ If you can't run Chromium in your environment (some sandboxed CI runners restric
 
 ```bash
 ./scripts/overty_smoke_protocol.sh
+```
+
+You can also keep `npm run smoke` working in browserless environments by enabling fallback:
+
+```bash
+OVERTY_SMOKE_ALLOW_NO_CHROME_SMOKE=1 npm run smoke
 ```
 
 ## Run (stdio)
@@ -52,6 +62,39 @@ Set a default endpoint (optional):
 
 ```bash
 OVERTY_BROWSER_URL=http://127.0.0.1:9222 node src/index.js
+```
+
+## Optional sidecar mode (launches chrome-devtools-mcp for you)
+
+`overty` can launch a local `chrome-devtools-mcp` process automatically when `OVERTY_WITH_CHROME_DEVTOOLS=1` is set.  
+This keeps `chrome-devtools-mcp` untouched and lets `overty` own the lifecycle (start and stop).
+
+### Sidecar env vars
+
+- `OVERTY_WITH_CHROME_DEVTOOLS`: `1` or `true` to enable sidecar.
+- `OVERTY_CHROME_DEVTOOLS_EXEC`: executable used to start sidecar (default: Node runtime path, same as `process.execPath`).
+- `OVERTY_CHROME_DEVTOOLS_CMD`:
+  - defaults to sibling `../chrome-devtools-mcp/build/src/index.js` when `OVERTY_CHROME_DEVTOOLS_EXEC` is Node
+  - defaults to empty when a non-node executable is provided.
+- `OVERTY_CHROME_DEVTOOLS_ARGS`: extra args for the sidecar; set as JSON array (e.g. `["--http-port","9333"]`) or as shell-like tokens (`--http-port 9333`).
+- `OVERTY_CHROME_DEVTOOLS_START_DELAY_MS`: delay (ms) after spawn before continuing startup (default: `1500`).
+
+Example:
+
+```bash
+OVERTY_WITH_CHROME_DEVTOOLS=1 \
+OVERTY_CHROME_DEVTOOLS_CMD=/absolute/path/to/chrome-devtools-mcp/build/src/index.js \
+OVERTY_CHROME_DEVTOOLS_ARGS='["--http-port","9223"]' \
+node src/index.js
+```
+
+Using a non-node executable
+
+```bash
+OVERTY_WITH_CHROME_DEVTOOLS=1 \
+OVERTY_CHROME_DEVTOOLS_EXEC=/usr/local/bin/chrome-devtools-mcp \
+OVERTY_CHROME_DEVTOOLS_ARGS='["--http-port","9223"]' \
+node src/index.js
 ```
 
 ## Codex MCP config (example)

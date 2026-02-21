@@ -8,8 +8,8 @@
   },
   "scripts": {
     "start": "node src/index.js",
+    "start:with-chrome-devtools": "OVERTY_WITH_CHROME_DEVTOOLS=1 node src/index.js",
     "smoke": "./scripts/overty_smoke.sh",
     "smoke:protocol": "./scripts/overty_smoke_protocol.sh"
   }
 }
-
